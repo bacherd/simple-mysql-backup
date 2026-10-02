@@ -1,86 +1,99 @@
-#!/bin/ash
+#!/bin/sh
+set -eu
 
-if [[ -z ${MYSQL_HOST} ]]; then
-    echo "ERROR: MYSQL_HOST variable is required."
-    exit 1
-fi
+: "${MYSQL_HOST:?ERROR: MYSQL_HOST variable is required.}"
+: "${MYSQL_PASS:?ERROR: MYSQL_PASS variable is required.}"
+: "${MYSQL_PORT:=3306}"
+: "${MYSQL_USER:=root}"
+: "${MYSQL_OPTS:=}"
+: "${DUMP_AT_START:=false}"
+: "${DUMP_TIME:=00:00}"
+: "${BACKUP_PATH:=/backup}"
 
-if [[ -z ${MYSQL_PORT} ]]; then
-    MYSQL_PORT="3306"
-fi
+# Pass credentials via option file instead of command line (hidden from ps)
+CLIENT_CNF="/tmp/client.cnf"
+umask 077
+escaped_pass=$(printf '%s' "${MYSQL_PASS}" | sed 's/[\\"]/\\&/g')
+cat > "${CLIENT_CNF}" <<CNF
+[client]
+host="${MYSQL_HOST}"
+port=${MYSQL_PORT}
+user="${MYSQL_USER}"
+password="${escaped_pass}"
+CNF
+umask 022
 
-if [[ -z ${MYSQL_USER} ]]; then
-    MYSQL_USER="root"
-fi
-
-if [[ -z ${MYSQL_PASS} ]]; then
-    echo "ERROR: MYSQL_PASS variable is required."
-    exit 1
-fi
-
-if [[ -z ${DUMP_AT_START} ]]; then
-    DUMP_AT_START=false
-fi
-
-if [[ -z ${DUMP_TIME} ]]; then
-    DUMP_TIME=00:00
-fi
-
-if [[ -z ${BACKUP_PATH} ]]; then
-    BACKUP_PATH=/backup
-fi
-
-mkdir -p ${BACKUP_PATH}
+mkdir -p "${BACKUP_PATH}"
 
 ###############################################################################
 
-function backup_db() {
-    echo "-> backup \"${db}\":"
-    mysqldump -h${MYSQL_HOST} -P${MYSQL_PORT} -u${MYSQL_USER} -p${MYSQL_PASS} ${db} > ${BACKUP_PATH}/${db}.sql
-}
+backup_db() {
+    db="$1"
+    target="${BACKUP_PATH}/${db}.sql"
+    echo "-> backup \"${db}\""
 
-###############################################################################
-
-function backup_all() {
-    echo "backup all databases"
-    DB_LIST=`echo "show databases;" | mysql -h${MYSQL_HOST} -P${MYSQL_PORT} -u${MYSQL_USER} -p${MYSQL_PASS}`
-    for db in ${DB_LIST}; do
-        if [ ${db} != "Database" ]; then
-            backup_db ${db}
-        fi
-    done
-}
-
-###############################################################################
-
-if [[ $# -eq 0 ]]; then
-    if [[ ${DUMP_AT_START} == "true" ]]; then
-        backup_all
-    fi
-
-    hour=$(echo "${DUMP_TIME}" | cut -d ':' -f 1)
-    min=$(echo "${DUMP_TIME}" | cut -d ':' -f 2)
-
-    if [[ ${hour} -gt 23 ]] || [[ ${hour} -lt 0 ]]; then
-        echo "ERROR: DUMP_TIME hour is out of range"
-        exit 1
-    fi
-    
-    if [[ ${min} -gt 59 ]] || [[ ${min} -lt 0 ]]; then
-        echo "ERROR: DUMP_TIME min is out of range"
-        exit 1
-    fi
-
-    #    min  hour day  month   weekday command
-    echo "${min} ${hour} *   *   * /entrypoint.sh backup" > /var/spool/cron/crontabs/root
-    /usr/sbin/crond -f -l 8
-else
-    if [[ $1 == "backup" ]]; then
-        backup_all
+    # Dump to temp file first so a failed dump never overwrites the last good backup
+    # shellcheck disable=SC2086 # MYSQL_OPTS is intentionally word-split
+    if mariadb-dump --defaults-extra-file="${CLIENT_CNF}" ${MYSQL_OPTS} \
+        --single-transaction --routines --triggers --events \
+        "${db}" > "${target}.tmp"; then
+        mv "${target}.tmp" "${target}"
     else
-        echo "ERROR: unknown parameter."
-        exit 1
+        echo "ERROR: backup of \"${db}\" failed" >&2
+        rm -f "${target}.tmp"
+        return 1
     fi
-fi
+}
 
-exit 0
+###############################################################################
+
+backup_all() {
+    echo "$(date '+%F %T') backup all databases"
+    failed=0
+
+    # shellcheck disable=SC2086 # MYSQL_OPTS is intentionally word-split
+    if ! dbs=$(mariadb --defaults-extra-file="${CLIENT_CNF}" ${MYSQL_OPTS} -N -e "SHOW DATABASES"); then
+        echo "ERROR: could not list databases" >&2
+        return 1
+    fi
+
+    for db in ${dbs}; do
+        case "${db}" in
+            information_schema|performance_schema|sys) continue ;;
+        esac
+        backup_db "${db}" || failed=1
+    done
+
+    return ${failed}
+}
+
+###############################################################################
+
+case "${1:-}" in
+    "")
+        case "${DUMP_TIME}" in
+            [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+            *) echo "ERROR: DUMP_TIME must be HH:MM (00:00-23:59)" >&2; exit 1 ;;
+        esac
+        hour="${DUMP_TIME%%:*}"; hour="${hour#0}"
+        min="${DUMP_TIME##*:}";  min="${min#0}"
+
+        if [ "${DUMP_AT_START}" = "true" ]; then
+            backup_all || echo "WARNING: initial backup failed" >&2
+        fi
+
+        # Redirect job output to PID 1 so it shows up in `docker logs`
+        echo "${min} ${hour} * * * /entrypoint.sh backup >/proc/1/fd/1 2>/proc/1/fd/2" \
+            > /var/spool/cron/crontabs/root
+
+        # exec: replace shell so tini forwards signals directly to crond
+        exec /usr/sbin/crond -f -l 8
+        ;;
+    backup)
+        backup_all
+        ;;
+    *)
+        echo "ERROR: unknown parameter \"$1\"" >&2
+        exit 1
+        ;;
+esac

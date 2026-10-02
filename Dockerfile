@@ -1,9 +1,10 @@
-FROM alpine:3.9
-MAINTAINER Dominik Bacher
+FROM alpine:3.24
+LABEL maintainer="Dominik Bacher"
 
-RUN apk add --update mariadb-client shadow && rm -rf /var/cache/apk/* 
+RUN apk add --no-cache mariadb-client mariadb-connector-c tini tzdata
 
-COPY src/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+ENV TZ=UTC
 
-ENTRYPOINT ["/entrypoint.sh"]
+COPY --chmod=755 src/entrypoint.sh /entrypoint.sh
+
+ENTRYPOINT ["/sbin/tini", "--", "/entrypoint.sh"]
